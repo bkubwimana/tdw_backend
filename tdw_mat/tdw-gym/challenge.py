@@ -11,9 +11,6 @@ import sys
 base_path = os.getcwd()
 sys.path.append(base_path)
 
-from h_agent import H_agent
-from lm_agent import lm_agent
-from vla_bridge_agent import VLABridgeAgent
 
 gym.envs.registration.register(
     id='transport_challenge_MA',
@@ -55,7 +52,11 @@ class Challenge:
                 os.makedirs(os.path.join(self.output_dir, str(episode)))
             self.logger.info('Episode {} ({}/{})'.format(episode, i + 1, num_eval_episodes))
             self.logger.info(f"Resetting Environment ... data is {self.data[episode]}")
-            state, info, env_api = self.env.reset(seed=self.data[episode]['seed'], options=self.data[episode], output_dir = os.path.join(self.output_dir, str(episode)))
+            state, info, env_api = self.env.unwrapped.reset(
+                seed=self.data[episode]['seed'],
+                options=self.data[episode],
+                output_dir=os.path.join(self.output_dir, str(episode)),
+            )
             for id, agent in enumerate(agents):
                 if type(env_api) == list:
                     curr_api = env_api[id]
@@ -175,10 +176,13 @@ def main():
     agents = []
     for i, agent in enumerate(args.agents):
         if agent == 'h_agent':
+            from h_agent import H_agent
             agents.append(H_agent(i, logger, args.max_frames, args.output_dir))
         elif agent == 'lm_agent':
+            from lm_agent import lm_agent
             agents.append(lm_agent(i, logger, args.max_frames, args, args.output_dir))
         elif agent == 'vla_bridge':
+            from vla_bridge_agent import VLABridgeAgent
             agents.append(VLABridgeAgent(i, logger, args.max_frames, args, args.output_dir))
         else:
             raise ValueError(f"Unknown agent type: {agent}")

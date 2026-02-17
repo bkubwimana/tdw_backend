@@ -29,10 +29,12 @@ class VLABridgeAgent:
     """
     Hybrid agent: physicai VLM planner + CoELA spatial memory.
 
-    Plan generation: VLM planner (or heuristic fallback) decides WHAT to do.
+    Plan generation: VLM planner decides WHAT to do.
     Plan execution: AgentMemory's A* pathfinding decides HOW to get there.
     Action output: discrete actions for CoELA's tdw_gym.
     """
+    _shared_dsm = None
+    _agent_instances = []
 
     def __init__(self, agent_id, logger, max_frames, args=None, output_dir='results'):
         self.agent_id = agent_id
@@ -51,8 +53,11 @@ class VLABridgeAgent:
 
         self._vlm_planner = None
         self._vlm_url = getattr(args, 'vlm_url', None) if args else None
+        self._n_agents = getattr(args, 'number_of_agents', 2) if args else 2
         self._dsm = None
         self.communication = getattr(args, 'communication', False) if args else False
+        if self.communication:
+            self._init_dsm()
 
         self.agent_memory = None
         self.obs = None
@@ -87,6 +92,7 @@ class VLABridgeAgent:
         self.gt_mask = True
         self.position = None
         self.forward = None
+        VLABridgeAgent._agent_instances.append(self)
 
     def reset(self, obs=None, goal_objects=None, output_dir=None, env_api=None,
               rooms_name=None, agent_color=None, agent_id=0, gt_mask=True, save_img=True):
@@ -139,11 +145,23 @@ class VLABridgeAgent:
     def _init_vlm_planner(self):
         try:
             from simulator.vla.vlm_planner import VLMPlanner
-            self._vlm_planner = VLMPlanner(url=self._vlm_url)
+            self._vlm_planner = VLMPlanner(server_url=self._vlm_url)
             logger.info("VLMPlanner initialized")
-        except Exception:
-            logger.info("VLMPlanner unavailable, using heuristic fallback")
-            self._vlm_planner = None
+        except Exception as e:
+            raise RuntimeError(f"VLMPlanner initialization failed: {e}")
+
+    def _init_dsm(self):
+        if VLABridgeAgent._shared_dsm is not None:
+            self._dsm = VLABridgeAgent._shared_dsm
+            return
+        try:
+            from physicai_integration import create_dsm
+            VLABridgeAgent._shared_dsm = create_dsm(n_agents=self._n_agents)
+            self._dsm = VLABridgeAgent._shared_dsm
+            logger.info("DSM initialized for VLABridgeAgent")
+        except Exception as e:
+            logger.warning(f"DSM init failed: {e}")
+            self._dsm = None
 
     # -- main loop --
 
@@ -157,6 +175,11 @@ class VLABridgeAgent:
             self._handle_invalid()
 
         self._update_agent_state()
+        if self._dsm and self.agent_id == 0 and (self.steps % 3 == 0):
+            try:
+                self._dsm.gossip_round(VLABridgeAgent._agent_instances)
+            except Exception:
+                pass
         self._update_memory()
 
         if self.obs['status'] == 0:
@@ -181,84 +204,92 @@ class VLABridgeAgent:
     # -- plan generation --
 
     def _generate_plan(self):
-        """VLM planner or heuristic fallback."""
-        if self._vlm_planner:
-            return self._vlm_plan()
-        return self._heuristic_plan()
+        """Generate plan from VLM only (fail-fast)."""
+        if not self._vlm_planner:
+            raise RuntimeError("VLMPlanner is not available; no fallback enabled")
+        return self._vlm_plan()
 
     def _vlm_plan(self):
-        """Ask VLM planner for next high-level action."""
+        """Ask VLM planner for next high-level action (no fallback)."""
         context = self._build_vlm_context()
         try:
-            from simulator.vla.vlm_planner import VLMPlanner
-            result = self._vlm_planner.plan(
-                image=self.obs['rgb'],
+            from simulator.vla.interface import VLAObservation
+            obs = VLAObservation(
+                rgb_image=self.obs['rgb'],
+                depth_image=np.zeros(self.obs['rgb'].shape[:2], dtype=np.float32),
                 instruction=self._goal_description(),
+                proprioception=np.array([*self.position, *self.forward[:3], 0.0, 0.0], dtype=np.float32),
                 context=context
             )
+            result = self._vlm_planner.plan(obs)
             return self._parse_vlm_result(result)
         except Exception as e:
-            logger.warning(f"VLM plan failed: {e}, falling back to heuristic")
-            return self._heuristic_plan()
-
-    def _heuristic_plan(self):
-        """Priority-based fallback: transport > grasp > explore."""
-        held = self.obs['held_objects']
-        has_target = any(h['type'] == 0 for h in held if h['id'] is not None)
-        has_container = any(h['type'] == 1 for h in held if h['id'] is not None)
-
-        if has_target and has_container:
-            if held[0]['type'] == 1 and held[0].get('contained', [None])[
-                -1] is None and held[1]['type'] == 0:
-                return f"put <{held[1]['name']}> ({held[1]['id']}) into container"
-            if held[1]['type'] == 1 and held[1].get('contained', [None])[
-                -1] is None and held[0]['type'] == 0:
-                return f"put <{held[0]['name']}> ({held[0]['id']}) into container"
-
-        if (has_target or has_container) and len(self.object_list[2]) > 0:
-            return "transport objects I'm holding to the bed"
-
-        # Grasp targets
-        if len(self.object_list[0]) > 0 and (held[0]['id'] is None or held[1]['id'] is None):
-            obj = self.object_list[0][0]
-            return f"go grasp target object <{obj['name']}> ({obj['id']})"
-
-        # Grasp container
-        if len(self.object_list[1]) > 0 and not has_container and (
-                held[0]['id'] is None or held[1]['id'] is None):
-            obj = self.object_list[1][0]
-            return f"go grasp container <{obj['name']}> ({obj['id']})"
-
-        # Explore unexplored rooms
-        for room in (self.rooms_name or []):
-            if room not in self.rooms_explored or self.rooms_explored[room] != 'all':
-                if room != self.current_room:
-                    return f"go to {room}"
-                return f"explore current room {room}"
-
-        return "[wait]"
+            raise RuntimeError(f"VLM plan failed: {e}")
 
     def _parse_vlm_result(self, result):
-        """Convert VLM planner output to CoELA plan string."""
-        mode = getattr(result, 'mode', 'NAV')
-        target = getattr(result, 'target', None)
-        if mode == 'MANIP' and target:
-            return f"go grasp target object <{target}>"
-        if mode == 'NAV' and target:
-            return f"go to {target}"
-        return self._heuristic_plan()
+        """Convert VLM planner output to CoELA plan string (strict parsing)."""
+        mode = str(getattr(result, 'mode', 'MOVE')).upper()
+        target = getattr(result, 'target_object', None) or getattr(result, 'target_location', None)
+        if mode.endswith("INTERACT"):
+            obj = self._resolve_object_target(target)
+            if obj is not None:
+                return f"go grasp target object <{obj['name']}> ({obj['id']})"
+            raise RuntimeError(f"VLM returned INTERACT but target wasn't resolvable: {target}")
+        if mode.endswith("MOVE") and target:
+            room = self._resolve_room_target(target)
+            if room is not None:
+                return f"go to {room}"
+            raise RuntimeError(f"VLM returned MOVE but room wasn't resolvable: {target}")
+        raise RuntimeError(f"Unrecognized/invalid VLM output: mode={mode}, target={target}")
+
+    def _resolve_object_target(self, target_text):
+        candidates = self.object_list[0] + self.object_list[1]
+        if not candidates:
+            return None
+        if target_text:
+            text = str(target_text).lower()
+            for obj in candidates:
+                name = str(obj.get("name", "")).lower()
+                if name and (name in text or text in name):
+                    return obj
+        px, pz = self.position[0], self.position[2]
+        return min(
+            candidates,
+            key=lambda o: (o["position"][0] - px) ** 2 + (o["position"][2] - pz) ** 2
+        )
+
+    def _resolve_room_target(self, target_text):
+        if not target_text or not self.rooms_name:
+            return None
+        text = str(target_text).lower()
+        for room in self.rooms_name:
+            if room.lower() in text or text in room.lower():
+                return room
+        return None
 
     def _build_vlm_context(self):
-        return {
+        context = {
             'goal': self._goal_description(),
             'current_room': self.current_room,
             'rooms_explored': self.rooms_explored,
             'holding': [h for h in self.obs['held_objects'] if h['id'] is not None],
             'visible_targets': len(self.object_list[0]),
             'visible_containers': len(self.object_list[1]),
+            'visible_target_names': [o.get('name') for o in self.object_list[0][:5]],
+            'visible_container_names': [o.get('name') for o in self.object_list[1][:5]],
             'satisfied_count': len(self.satisfied),
             'step': self.num_frames,
         }
+        if self._dsm:
+            try:
+                nearby = self._dsm.get_nearby_agents(tuple(self.position), radius=3.0, requester_id=str(self.agent_id))
+                context['nearby_agents'] = [
+                    {"agent_id": a.agent_id, "state": a.state, "task_id": a.task_id}
+                    for a in nearby
+                ]
+            except Exception:
+                pass
+        return context
 
     # -- plan execution (reuses AgentMemory pathfinding) --
 
@@ -393,6 +424,16 @@ class VLABridgeAgent:
                 self.satisfied.append(oid)
                 self.object_map[np.where(self.id_map == oid)] = 0
                 self.id_map[np.where(self.id_map == oid)] = 0
+        if self._dsm:
+            try:
+                self._dsm.write_agent_state(
+                    agent_id=str(self.agent_id),
+                    position=(float(self.position[0]), float(self.position[1]), float(self.position[2])),
+                    state="active",
+                    task_id=self.plan
+                )
+            except Exception:
+                pass
 
     def _update_memory(self):
         ignore_ids = self.with_character + self.with_oppo + self.satisfied

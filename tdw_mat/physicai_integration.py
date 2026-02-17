@@ -23,15 +23,16 @@ def create_vlm_adapter(url=None):
     return VLMAdapter(vlm_url=url)
 
 
-def create_dsm(gossip_period_ms=50.0, max_aoi_ms=3000.0):
+def create_dsm(n_agents=2, gossip_period_ms=50.0, max_aoi_ms=3000.0):
     """Create DSM instance for multi-agent coordination."""
     try:
         from simulator.coordination.dsm import DistributedSharedMemory
         return DistributedSharedMemory(
+            n_agents=n_agents,
             gossip_period_ms=gossip_period_ms,
             max_aoi_ms=max_aoi_ms
         )
-    except ImportError:
+    except Exception:
         return None
 
 
